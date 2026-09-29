@@ -1,0 +1,27 @@
+name: Build EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pyrogram tgcrypto mutagen qrcode pillow pyinstaller
+
+      - name: Build exe
+        run: pyinstaller --onefile --name RecordsUploader --hidden-import=PIL._tkinter_finder serv__3_.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RecordsUploader
+          path: dist/RecordsUploader.exe
