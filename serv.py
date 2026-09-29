@@ -69,7 +69,7 @@ async def _authorize_no_input(self):
 Client.authorize = _authorize_no_input
 
 
-API_ID   = 38196585 #айди апи телеги
+API_ID   = 8816351650 #айди апи телеги
 API_HASH = "c60f74415092bf10723edf0cd090262b" #хеш апи телеги
 CHAT_ID  = -4315693472 #айди чата для записей
 
