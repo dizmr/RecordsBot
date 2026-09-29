@@ -3,6 +3,7 @@ import os
 import re
 import asyncio
 import json
+import shutil
 import tkinter as tk
 from tkinter import filedialog, simpledialog, messagebox
 from datetime import datetime
@@ -41,6 +42,9 @@ class Logger:
     def flush(self):
         self.log.flush()
 
+    def close(self):
+        self.log.close()
+
 sys.stdout = Logger()
 sys.stderr = sys.stdout
 print(f"\n[{datetime.now().strftime('%d.%m.%Y %H:%M:%S')}] ===== ПРОГРАММА ЗАПУЩЕНА =====")
@@ -69,6 +73,7 @@ async def _authorize_no_input(self):
 Client.authorize = _authorize_no_input
 
 
+# Задайте эти значения в переменных окружения, не храните их в исходном коде.
 API_ID   = 8816351650 #айди апи телеги
 API_HASH = "c60f74415092bf10723edf0cd090262b" #хеш апи телеги
 CHAT_ID  = -4315693472 #айди чата для записей
@@ -79,9 +84,20 @@ TOPIC_ID_LONG   = 6 #Длинные
 
 CONFIG_FILE         = "config.json"
 STATS_FILE          = "stats.json"
+SENT_RECORDS_FILE   = "sent_records.json"
 SESSION_NAME        = "employee_session"
 STABILITY_THRESHOLD = 5
 FILE_SETTLE_SECONDS = 10
+SEND_RETRIES        = 3
+
+
+def atomic_save_json(filename: str, data: dict):
+    temporary_file = f"{filename}.tmp"
+    with open(temporary_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary_file, filename)
 
 def load_config() -> dict:
     if os.path.exists(CONFIG_FILE):
@@ -93,8 +109,7 @@ def load_config() -> dict:
     return {}
 
 def save_config(data: dict):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+    atomic_save_json(CONFIG_FILE, data)
 
 def get_config():
     cfg = load_config()
@@ -124,6 +139,10 @@ def get_config():
 
 
 def make_client():
+    if not API_ID or not API_HASH or not CHAT_ID:
+        raise RuntimeError(
+            "Задайте TELEGRAM_API_ID, TELEGRAM_API_HASH и TELEGRAM_CHAT_ID."
+        )
     cfg   = load_config()
     proxy = cfg.get("proxy", None)
     kwargs = dict(api_id=API_ID, api_hash=API_HASH, ipv6=False)
@@ -347,12 +366,14 @@ async def qr_auth(client: Client):
 
                 deadline = result.expires
                 scanned = False
+                next_check = time.monotonic()
                 while not win.is_closed() and int(time.time()) < deadline:
                     win.update()
                     await asyncio.sleep(0.5)
 
 
-                    if int(time.time()) % 3 == 0:
+                    if time.monotonic() >= next_check:
+                        next_check = time.monotonic() + 3
                         try:
                             check = await asyncio.wait_for(
                                 client.invoke(
@@ -485,6 +506,45 @@ def get_audio_duration(file_path: str) -> float:
         print(f"Ошибка длительности: {e}")
     return 0.0
 
+
+def file_fingerprint(file_path: str, stat_result=None) -> str:
+    st = stat_result or os.stat(file_path)
+    normalized_path = os.path.normcase(os.path.abspath(file_path))
+    return f"{normalized_path}|{st.st_size}|{st.st_mtime_ns}"
+
+
+def load_sent_records() -> dict:
+    if os.path.exists(SENT_RECORDS_FILE):
+        try:
+            with open(SENT_RECORDS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Ошибка журнала отправок: {e}")
+    return {}
+
+
+def save_sent_records(records: dict):
+    atomic_save_json(SENT_RECORDS_FILE, records)
+
+
+def get_archive_path(watch_path: str) -> str:
+    parent = os.path.dirname(os.path.abspath(watch_path))
+    folder_name = os.path.basename(os.path.normpath(watch_path))
+    return os.path.join(parent, f"{folder_name}_sent")
+
+
+def move_to_archive(file_path: str, archive_path: str) -> str:
+    os.makedirs(archive_path, exist_ok=True)
+    destination = os.path.join(archive_path, os.path.basename(file_path))
+    if os.path.exists(destination):
+        stem, extension = os.path.splitext(os.path.basename(file_path))
+        destination = os.path.join(
+            archive_path,
+            f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}{extension}"
+        )
+    return shutil.move(file_path, destination)
+
 def format_duration(seconds: float) -> str:
     s = int(seconds)
     if s < 60:
@@ -500,9 +560,9 @@ def is_file_locked(file_path: str) -> bool:
     except OSError:
         return True
 
-def is_file_stable(file_path: str) -> bool:
+def is_file_stable(file_path: str, stat_result=None) -> bool:
     try:
-        st = os.stat(file_path)
+        st = stat_result or os.stat(file_path)
         if st.st_size <= 1024:
             return False
         if time.time() - st.st_mtime < FILE_SETTLE_SECONDS:
@@ -537,14 +597,29 @@ def load_stats() -> dict:
     return default
 
 def save_stats(stats: dict):
-    with open(STATS_FILE, "w", encoding="utf-8") as f:
-        json.dump(stats, f, ensure_ascii=False, indent=2)
+    atomic_save_json(STATS_FILE, stats)
+
+
+async def send_audio_with_retry(client: Client, **kwargs):
+    for attempt in range(1, SEND_RETRIES + 1):
+        try:
+            return await client.send_audio(**kwargs)
+        except (OSError, ConnectionError, asyncio.TimeoutError):
+            if attempt == SEND_RETRIES:
+                raise
+            delay = 2 ** (attempt - 1)
+            print(f"Сетевая ошибка отправки, повтор через {delay} сек.")
+            await asyncio.sleep(delay)
+            if not getattr(client, "is_connected", False):
+                await client.connect()
 
 
 
 async def monitor_and_upload(client: Client, watch_path: str, employee_name: str):
     stats        = load_stats()
+    sent_records = load_sent_records()
     file_tracker : dict = {}
+    archive_path = get_archive_path(watch_path)
 
     print("Прогреваю кэш диалогов...")
     try:
@@ -564,36 +639,61 @@ async def monitor_and_upload(client: Client, watch_path: str, employee_name: str
                 await asyncio.sleep(5)
                 continue
 
-            audio_files = [
-                os.path.join(watch_path, f)
-                for f in os.listdir(watch_path)
-                if f.lower().endswith((".wav", ".mp3"))
-            ]
+            with os.scandir(watch_path) as entries:
+                audio_files = [
+                    (entry.path, entry.stat())
+                    for entry in entries
+                    if entry.is_file() and entry.name.lower().endswith((".wav", ".mp3"))
+                ]
 
             pending = []
 
-            for file_path in audio_files:
+            for file_path, stat_result in audio_files:
                 try:
-                    curr_size = os.path.getsize(file_path)
+                    curr_size = stat_result.st_size
+                    curr_mtime = stat_result.st_mtime_ns
+                    fingerprint = file_fingerprint(file_path, stat_result)
                     info = file_tracker.get(file_path, {"size": 0, "stable_ticks": 0})
 
                     if curr_size > 1024 and curr_size == info["size"]:
                         info["stable_ticks"] += 1
                     else:
                         info["stable_ticks"] = 0
+                        info["sent"] = False
+
+                    if curr_mtime != info.get("mtime"):
+                        info["stable_ticks"] = 0
+                        info["sent"] = False
 
                     info["size"] = curr_size
+                    info["mtime"] = curr_mtime
                     file_tracker[file_path] = info
+
+                    if fingerprint in sent_records:
+                        try:
+                            move_to_archive(file_path, archive_path)
+                            file_tracker.pop(file_path, None)
+                            print(f"Перенесен ранее отправленный файл: {os.path.basename(file_path)}")
+                        except OSError as e:
+                            print(f"Ошибка переноса ранее отправленного файла {file_path}: {e}")
+                        continue
+
+                    if info.get("sent"):
+                        continue
+
+                    stable = (
+                        info["stable_ticks"] >= STABILITY_THRESHOLD
+                        and is_file_stable(file_path, stat_result)
+                    )
 
                     fname = os.path.basename(file_path)
                     print(
                         f"  {fname} | {curr_size}б | "
                         f"тики:{info['stable_ticks']}/{STABILITY_THRESHOLD} | "
-                        f"stable:{is_file_stable(file_path)}"
+                        f"stable:{stable}"
                     )
 
-                    if (info["stable_ticks"] >= STABILITY_THRESHOLD
-                            and is_file_stable(file_path)):
+                    if stable:
                         pending.append(file_path)
 
                 except FileNotFoundError:
@@ -601,9 +701,15 @@ async def monitor_and_upload(client: Client, watch_path: str, employee_name: str
                 except Exception as e:
                     print(f"Ошибка файла {file_path}: {e}")
 
+            stats_dirty = False
             for file_path in pending:
                 fname = os.path.basename(file_path)
                 try:
+                    stat_result = os.stat(file_path)
+                    fingerprint = file_fingerprint(file_path, stat_result)
+                    if fingerprint in sent_records:
+                        continue
+
                     phone     = extract_phone_number(fname)
                     dur_sec   = get_audio_duration(file_path)
                     dur_label, topic_id = classify_call(dur_sec)
@@ -619,26 +725,42 @@ async def monitor_and_upload(client: Client, watch_path: str, employee_name: str
 
                     print(f"Отправляю: {fname} -> тема #{topic_id}")
 
-                    await client.send_audio(
+                    await send_audio_with_retry(
+                        client,
                         chat_id=CHAT_ID,
                         audio=file_path,
                         caption=caption,
                         reply_to_message_id=topic_id,
                     )
 
-                    os.remove(file_path)
-                    file_tracker.pop(file_path, None)
+                    sent_records[fingerprint] = {
+                        "sent_at": datetime.now().isoformat(timespec="seconds"),
+                        "filename": fname,
+                    }
+                    save_sent_records(sent_records)
+
+                    try:
+                        move_to_archive(file_path, archive_path)
+                        file_tracker.pop(file_path, None)
+                    except OSError as e:
+                        print(f"Отправлен, но не перенесен в архив {fname}: {e}")
+
+                    if file_path in file_tracker:
+                        file_tracker[file_path]["sent"] = True
 
                     stats["total_sent"] += 1
-                    save_stats(stats)
-                    print(f"Отправлен и удалён: {fname}")
+                    stats_dirty = True
+                    print(f"Отправлен: {fname}")
 
                 except Exception as e:
                     print(f"Ошибка отправки {fname}: {e}")
                     stats["total_errors"] = stats.get("total_errors", 0) + 1
-                    save_stats(stats)
+                    stats_dirty = True
                     if file_path in file_tracker:
                         file_tracker[file_path]["stable_ticks"] = 0
+
+            if stats_dirty:
+                save_stats(stats)
 
             for path in list(file_tracker.keys()):
                 if not os.path.exists(path):
@@ -685,3 +807,8 @@ if __name__ == "__main__":
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         print("Выход.")
+    finally:
+        logger = sys.stdout
+        if isinstance(logger, Logger):
+            logger.flush()
+            logger.close()
